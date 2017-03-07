@@ -1,0 +1,21 @@
+{
+  "name": "study-backbone",
+  "version": "1.0.0",
+  "description": "Notes of Backbone",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "study",
+    "backbone"
+  ],
+  "author": "Guo Chen",
+  "license": "ISC",
+  "dependencies": {
+    "underscore": "^1.8.3"
+  },
+  "devDependencies": {
+    "eslint": "^3.17.0"
+  }
+}

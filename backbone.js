@@ -39,6 +39,10 @@
 
   Backbone.emulateJSON = false;
 
+  // 把Underscore方法加到Model或Collection上,分别以attributes属性和models属性作为
+  // 上下文,如
+  // model.keys();
+  // collection.filter(function(model) { return model.get('age') > 10 });
   var addMethod = function (length, method, attribute) {
     switch (length) {
       case 1: return function () {
@@ -60,7 +64,10 @@
       };
     }
   };
-
+  // @param {Object} Class Model或Collection
+  // @param {Object} methods 需要添加的方法和参数数量的哈希
+  // @param {String} attribute 作为上下文的属性名(Model的attributes或Collection的
+  // models)
   var addUnderscoreMethods = function (Class, methods, attribute) {
     _.each(methods, function (length, method) {
       if (_[method]) Class.prototype[method] = addMethod(length, method, attribute);
@@ -71,7 +78,7 @@
     if (_.isFunction(iteratee)) return iteratee;
     // 传入一个对象(模型的属性)用于搜索匹配的model
     if (_.isObject(iteratee) && !instance._isModel(iteratee)) return modelMatcher(iteratee);
-    // 传入一个字符串用于...
+    // 传入一个字符串(属性名),返回指定的属性
     if (_.isString(iteratee)) return function (model) { return model.get(iteratee); };
     return iteratee;
   };
@@ -255,7 +262,7 @@
         // 逻辑很强悍,一举搞定了off传参剩下几种情况
         if (
           callback && callback !== handler.callback &&
-            callback !== handler.callback._callback || // ?_callback
+            callback !== handler.callback._callback || // _callback, 见once
               context && context !== handler.context
         ) {
           remaining.push(handler);
@@ -299,6 +306,34 @@
     return this;
   };
 
+  Events.once = function (name, callback, context) {
+    // onceMap把name映射成{event: _.once(callback)}形式
+    var events = eventsApi(onceMap, {}, name, callback, _.bind(this.off, this));
+    // 一定要传入context?
+    if (typeof name === 'string' && context == null) callback = void 0;
+    return this.on(events, callback, context);
+  };
+
+  var onceMap = function (map, name, callback, offer) {
+    if (callback) {
+      // _.once确保map[name]只会被调用一次
+      var once = map[name] = _.once(function () {
+        // 解绑事件
+        offer(name, once);
+        callback.apply(this, arguments);
+      });
+      // 非once的原始版本callback也要存下来,用户可能调用off(当然以callback为参数)
+      // 移除这个once回调
+      once._callback = callback;
+    }
+    return map;
+  };
+
+  Events.listenToOnce = function (obj, name, callback) {
+    var events = eventsApi(onceMap, {}, name, callback, _.bind(this.stopListening, this, obj));
+    return this.listenTo(obj, events);
+  };
+
   // 触发'name'事件，可以附加参数
   Events.trigger = function (name) {
     if (!this._events) return this;
@@ -337,4 +372,455 @@
   Events.unbind = Events.off;
 
   _.extend(Backbone, Events);
+
+
+  // Backbone.Model
+  // ==============
+
+  // 创建一个模型,会自动分配一个client id('cid')
+  var Model = Backbone.Model = function (attributes, options) {
+    var attrs = attributes || {};
+    options || (options = {});
+    this.preinitialize.apply(this, arguments);
+    this.cid = _.uniqueId(this.cidPrefix);
+    this.attributes = {};
+    if (options.collection) this.collection = options.collection;
+    if (options.parse) attrs = this.parse(attrs, options) || {};
+    // 返回this[defaults]
+    var defaults = _.result(this, 'defaults');
+    // extend先添加默认属性、传进来的属性,为防止传进来的attrs将某些应该是
+    // 默认的属性覆盖成undefined,于是又调用_.defaults填充undefined属性,
+    // 那为什么不_.defaults({}, attrs, defaults)?
+    attrs = _.defaults(_.extend({}, defaults, attrs), defaults);
+    this.set(attrs, options);
+    this.changed = {};
+    this.initialize.apply(this, arguments);
+  };
+
+  _.extend(Model.prototype, Events, {
+
+    // 一组属性的哈希(current和previous(上一次change事件发生时的属性)不同)
+    changed: null,
+
+    // 上一次验证失败返回的值
+    validationError: null,
+
+    // 表示(服务器端)id的属性名,可自行指定
+    idAttribute: 'id',
+
+    // 生成client id时的前缀
+    cidPrefix: 'c',
+
+    // 模型初始化之前调用
+    preinitialize: function () {},
+
+    initialize: function () {},
+
+    // 返回attributes的一份浅拷贝
+    toJSON: function (options) {
+      return _.clone(this.attributes);
+    },
+
+    // proxy 'Backbone.sync'
+    sync: function () {
+      return Backbone.sync.apply(this, arguments);
+    },
+
+    // 获取属性值
+    get: function (attr) {
+      return this.attributes[attr];
+    },
+
+    // 获取HTML转义的属性值
+    escape: function (attr) {
+      return _.escape(this.get(attr));
+    },
+
+    // 判断是否含有某个属性(不为null或undefined)
+    has: function (attr) {
+      return this.get(attr) != null;
+    },
+
+    // 判断模型属性是否与给定attrs匹配
+    matches: function (attrs) {
+      return !!_.iteratee(attrs, this)(this.attributes);
+    },
+
+    // model的核心方法,设置属性并触发'change',通知观察者
+    // 可以set(key, value, options),也可以set({key: value}, options)
+    set: function (key, val, options) {
+      if (key == null) return this;
+
+      var attrs;
+      // {key: value}形式
+      if (typeof key === 'obj') {
+        attrs = key;
+        options = val;
+      // key, value形式
+      } else {
+        (attrs = {})[key] = val;
+      }
+
+      options || (options = {});
+
+      // 验证
+      if (!this._validate(attrs, options)) return false;
+
+      // 是否是 删除属性(unset方法的逻辑也在这个函数里)
+      var unset = options.unset;
+      // 是否发出change事件
+      var silent = options.silent;
+      // 方便触发事件的时候使用
+      var changes = [];
+      // _changing为false是什么情况?
+      var changing = this._changing;
+      this._changing = true;
+
+      // 不是changing状态,那就开始change,previous属性设为当前属性,
+      // changed属性初始化
+      if (!changing) {
+        this._previousAttributes = _.clone(this.attributes);
+        // 跟previous相比change的属性
+        this.changed = {};
+      }
+
+      var current = this.attributes;
+      var changed = this.changed;
+      var prev = this._previousAttributes;
+
+      for (var attr in attrs) {
+        val = attrs[attr];
+        // 变化的属性存在changes里面,方便下面触发change事件时作为参数
+        if (!_.isEqual(current[attr], val)) changes.push(attr);
+        // changed存放变化的属性,如果本次和上次相等,那么从changed中删除该属性
+        if (!_.isEqual(prev[attr], val)) {
+          changed[attr] = val;
+        } else {
+          delete changed[attr];
+        }
+        unset ? delete current[attr] : current[attr] = val;
+      }
+
+      // 更新id(要单独处理,因为要通过idAttribute获取新id值)
+      if (this.idAttribute in attrs) this.id = this.get(this.idAttribute);
+
+      // 触发属性变化事件
+      if (!silent) {
+        // _pending: ??
+        if (changes.length) this._pending = options;
+        for (var i = 0; i < changes.length; i++) {
+          this.trigger('change:' + changes[i], this, current[changes[i]], options);
+        }
+      }
+
+      if (changing) return this;
+      if (!silent) {
+        while (this._pending) {
+          options = this._pending;
+          this._pending = false;
+          this.trigger('change', this, options);
+        }
+      }
+      this._pending = false;
+      this._changing = false;
+      return this;
+    },
+
+    // 删除属性,触发'change'事件
+    unset: function (attr, options) {
+      return this.set(attr, void 0, _.extend({}, options, {unset: true}));
+    },
+
+    // 删除所有属性,触发'change'事件
+    clear: function (options) {
+      var attrs = {};
+      for (var key in this.attributes) attrs[key] = void 0;
+      return this.set(attrs, _.extend({}, options, {unset: true}));
+    },
+
+    // 检查从上一次'change'事件以来,是否发生了改变
+    // 可以检查特定属性
+    hasChanged: function (attr) {
+      if (attr == null) return !_.isEmpty(this.changed);
+      return _.has(this.changed, attr);
+    },
+
+    // 返回一个包含了所有发生了改变的属性的对象,或者false(没有改变);
+    // 还可以传入一个属性对象比较是否会发生改变
+    changedAttributes: function (diff) {
+      if (!diff) return this.hasChanged() ? _.clone(this.changed) : false;
+      var old = this._changing ? this._previousAttributes : this.attributes;
+      var changed = {};
+      var hasChanged;
+      for (var attr in diff) {
+        var val = diff[attr];
+        if (_.isEqual(old[attr], val)) continue;
+        changed[attr] = val;
+        hasChanged = true;
+      }
+      return hasChanged ? changed : false;
+    },
+
+    // 获取之前的某属性值,即上一次'change'触发时记下的值
+    previous: function (attr) {
+      if (attr == null || !this._previousAttributes) return null;
+      return this._previousAttributes[attr];
+    },
+
+    // 获取所有的上一次'change'发生时的原属性
+    previousAttributes: function () {
+      return _.clone(this._previousAttributes);
+    },
+
+    // 从服务器获取模型,合并response和本地的模型属性,任何发生改变的属性
+    // 都会触发'change'事件
+    // @param {Object} options 形如{success: .., error: .., context: .., parse: ..}
+    fetch: function (options) {
+      options = _.extend({parse: true}, options);
+      var model = this;
+      var success = options.success;
+      options.success = function (resp) {
+        var serverAttrs = options.parse ? model.parse(resp, options) : resp;
+        if (!model.set(serverAttrs, options)) return false;
+        if (success) success.call(options.context, model, resp, options);
+        model.trigger('sync', model, resp, options);
+      };
+      wrapError(this, options);
+      // ?
+      return this.sync('read', this, options);
+    },
+
+    // 设置模型属性,并同步到服务器,如果服务器返回不一样的属性哈希,模型属性
+    // 会再次被设定
+    save: function (key, val, options) {
+      var attrs;
+      if (key == null || typeof key === 'object') {
+        attrs = key;
+        options = val;
+      } else {
+        (attrs = {})[key] = val;
+      }
+
+      options = _.extend({validate: true, parse: true}, options);
+      // wait: 可以指定是否等待服务端的返回结果再一次性更新model,默认情况下不等待
+      var wait = options.wait;
+
+      // 如果不等待,那直接set,出错返回
+      // 如果等待,那先验证,出错返回
+      if (attrs && !wait) {
+        if (!this.set(attrs, options)) return false;
+      } else if (!this._validate(attrs, options)) {
+        return false;
+      }
+
+      var model = this;
+      var success = options.success;
+      var attributes = this.attributes;
+      // 跟WrapError类似,把success包装一下,做一些额外的工作
+      options.success = function (resp) {
+        // 确保
+        model.attributes = attributes;
+        var serverAttrs = options.parse ? model.parse(resp, options) : resp;
+        // 如果等待服务器返回,返回的属性也加入到要set的属性中
+        if (wait) serverAttrs = _.extend({}, attrs, serverAttrs);
+        // set属性,出错返回
+        if (serverAttrs && !model.set(serverAttrs, options)) return false;
+        if (success) success.call(options.context, model, resp, options);
+        model.trigger('sync', model, resp, options);
+      };
+      wrapError(this, options);
+
+      // 如果wait,this.attributes还未设好,但是下面要判断isNew,所以先直接
+      // 改this.attributes,判断完isNew再改回来
+      if (attrs && wait) this.attributes = _.extend({}, attributes, attrs);
+
+      // 根据是不是新建的模型(服务器上还没有)、是否指定了patch选项,采用不同的
+      // 同步方法：create/patch/update
+      var method = this.isNew() ? 'create' : (options.patch ? 'patch' : 'update');
+      if (method === 'patch' && !options.attrs) options.attrs = attrs;
+      var xhr = this.sync(method, this, options);
+
+      // this.attributes改回来
+      // 当然如果不wait,这俩是一样的
+      this.attributes = attributes;
+
+      return xhr;
+    },
+
+    // 如果服务器上存在model,从服务器上删除;如果模型属于某个集合,从集合中删除;
+    // 如果设置了wait: true,等待服务器响应后再从集合中删除
+    destroy: function (options) {
+      options = options ? _.clone(options) : {};
+      var model = this;
+      var success = options.success;
+      var wait = options.wait;
+
+      var destroy = function () {
+        model.stopListening();
+        model.trigger('destroy', model, model.collection, options);
+      };
+
+      // 跟WrapError类似,把success包装一下
+      options.success = function (resp) {
+        // 需要等待,在这个回调里destory(不需要等待的情况在#682进行了destroy)
+        if (wait) destroy();
+        if (success) success.call(options.context, model, resp, options);
+        // 如果model不是首次存入服务器,触发'sync'事件
+        if (!model.isNew()) model.trigger('sync', model, resp, options);
+      };
+
+      var xhr = false;
+      // 服务器上还没有该model,当然成功了,异步执行success
+      if (this.isNew()) {
+        _.defer(options.success);
+      // 否则,调用sync进行删除
+      } else {
+        wrapError(this, options);
+        xhr = this.sync('delete', this, options);
+      }
+      // 不用等待,直接destroy
+      if (!wait) destroy();
+      return xhr;
+    },
+
+    // 默认的url,model在服务器上的标识
+    url: function () {
+      var base =
+        _.result(this, 'urlRoot') ||
+        _.result(this.collection, 'url') ||
+        urlError();
+      if (this.isNew()) return base;
+      var id = this.get(this.idAttribute);
+      return base.replace(/[^\/]$/, '$&/') + encodeURIComponent(id);
+    },
+
+    // 将resp解析成属性哈希,set时会调用,用户自行传入,默认情况只是简单返回resp
+    parse: function (resp, options) {
+      return resp;
+    },
+
+    clone: function () {
+      return this.constructor(this.attributes);
+    },
+
+    // 所谓new就是模型还未被存入服务器,因而不会有服务器端id属性
+    isNew: function () {
+      return !this.has(this.idAttribute);
+    },
+
+    isValid: function (options) {
+      return this._validate({}, _.extend({}, options, {validate: true}));
+    },
+
+    // 调用用户定义的validate方法进行验证
+    _validate: function (attrs, options) {
+      if (!options.validate || !this.validate) return true;
+      attrs = _.extend({}, this.attributes, attrs);
+      var error = this.validationError = this.validate(attrs, options) || null;
+      if (!error) return true;
+      this.trigger('invalid', this, error, _.extend(options, {validationError: error}));
+      return false;
+    }
+
+  });
+
+  // Model要实现的Underscore方法,值是参数数量
+  var modelMethods = {key: 1, values: 1, pairs: 1, invert: 1, pick: 0, omit: 0, chain: 1, isEmpty: 1};
+
+  // 混入Underscore方法,以model的attributes属性作为上下文
+  addUnderscoreMethods(Model, modelMethods, 'attributes');
+
+  // 需要一个URL而未提供时,抛出一个错误
+  var urlError = function () {
+    throw new Error('A "url" property or function must be specified');
+  };
+
+  // 包装一下options中传入的error回调,使其调用的同时触发'error'事件
+  var wrapError = function (model, options) {
+    var error = options.error;
+    options.error = function (resp) {
+      if (error) error.call(options.context, model, resp, options);
+      model.trigger('error', model, resp, options);
+    };
+  };
+
+
+  // Backbone.sync
+  // ----------------------
+
+  // 可以覆盖这个方法,改变Backbone保持model与server上一致的行为。方法可以接收
+  // 三个参数:请求方法的类型,要同步的model和一些选项。默认行为是向model的url
+  // (由模型上的url方法获取)发起一个RESTful Ajax请求。
+  Backbone.sync = function (method, model, options) {
+    var type = methodMap[method];
+
+    // 两个emulate的默认设置
+    _.defaults(options || (options ={}), {
+      emulateHTTP: Backbone.emulateHTTP,
+      emulateJSON: Backbone.emulateJSON
+    });
+
+    var params = {type: type, dataType: 'json'};
+
+    // 确保有一个url
+    if (!options.url) {
+      params.url = _.result(model, 'url') || urlError();
+    }
+
+    // 确保create updata patch方法带数据
+    if (options.data == null && model && (method === 'create' || method === 'update' || method === 'patch')) {
+      params.contentType = 'application/json';
+      params.data = JSON.stringify(options.attrs || model.toJSON(options));
+    }
+
+    // 对于不支持JSON的服务器,将数据存入params中,以表单形式提交
+    if (options.emulateJSON) {
+      params.contentType = 'application/x-www-form-urlencoded';
+      params.data = params.data ? {model: params.data} : {};
+    }
+
+    // HTTP方法都识别不全的更老服务器...
+    if (options.emulateHTTP && (type === 'PUT' || type === 'DELETE' || type === 'PATCH')) {
+      params.type = 'POST';
+      if (options.emulateJSON) params.data._method = type;
+      var beforeSend = options.beforeSend;
+      options.beforeSend = function (xhr) {
+        xhr.setRequestHeader('X-HTTP-Method-Override', type);
+        if (beforeSend) return beforeSend.apply(this, arguments);
+      };
+    }
+
+    // jQuery的ajax配置选项processData:默认情况下,通过data选项传进来的数据,
+    // 会处理转化成一个查询字符串。此处对于非GET方法且不需模拟JSON数据的情况,
+    // 传的都是JSON数据,所以这个选项设为false
+    if (params.type !== 'GET' && !options.emulateJSON) {
+      params.processData = false;
+    }
+
+    // 给error回调传入xhr,表示请求状态的文本,请求抛出的错误三个参数
+    var error = options.error;
+    options.error = function (xhr, textStatus, errorThrown) {
+      options.textStatus = textStatus;
+      options.errorThrown = errorThrown;
+      if (error) error.call(options.context, xhr, textStatus, errorThrown);
+    };
+
+    var xhr = options.xhr = Backbone.ajax(_.extend(params, options));
+    model.trigger('request', model, xhr, options);
+    return xhr;
+  };
+
+  // restful方法名到HTTP方法的映射
+  var methodMap = {
+    'create': 'POST',
+    'update': 'PUT',
+    'patch': 'PATCH',
+    'delete': 'DELETE',
+    'read': 'GET'
+  };
+
+  // 默认用$库的ajax方法发送ajax
+  Backbone.ajax = function () {
+    return Backbone.$.ajax.apply(Backbone.$, arguments);
+  };
 }));

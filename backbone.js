@@ -1,6 +1,6 @@
 (function (factory) {
-  var root = (typeof self == 'object' && self.self === self && self) ||
-            (typeof global == 'object' && global.global === global && global);
+  var root = typeof self == 'object' && self.self === self && self ||
+            typeof global == 'object' && global.global === global && global;
 
   // amd
   if (typeof define === 'function' && define.amd) {
@@ -17,7 +17,7 @@
     root.Backbone = factory(root, {}, root._, (root.jQuery || root.Zepto || root.ender || root.$));
   }
 
-}(function (root, Backbone, _, $) {
+})(function (root, Backbone, _, $) {
 
   // Initial Setup
   // -------------
@@ -118,20 +118,21 @@
    */
   var eventsApi = function (iteratee, events, name, callback, opts) {
     var i = 0, names;
+    // 第三种情况
     if (name && typeof name === 'object') {
-      // 第三种情况
+      // 这种情况还可以不指定callback,直接传入context,见test/events.js #99
       if (callback !== void 0 && 'context' in opts && opts.context === void 0)
         opts.context = callback;
       for (names = _.keys(name); i < names.length; i++) {
         events = eventsApi(iteratee, events, names[i], name[names[i]], opts);
       }
+    // 第二种情况
     } else if (name && eventSplitter.test(name)) {
-      // 第二种情况
       for (names = name.split(eventSplitter); i < names.length; i++) {
         events = iteratee(events, names[i], callback, opts);
       }
+    // 第一种情况
     } else {
-      // 第一种情况
       events = iteratee(events, name, callback, opts);
     }
     return events;
@@ -158,6 +159,7 @@
       listeners[listening.id] = listening;
     }
 
+    // 返回obj以链式调用
     return obj;
   };
 
@@ -168,8 +170,10 @@
       var context = options.context, ctx = options.ctx, listening = options.listening;
       if (listening) listening.count++;
 
-      // 处理对象不光有callback,还有callback的上下文context,对象自身的引用ctx
-      // 对象的观察记录
+      // 处理对象不光有callback,还有callback的上下文context和ctx,trigger时使用的
+      // 都是ctx,即没有传入context的情况下用的上下文就是对象自身,还要另存一份context
+      // 用于off时的比较
+      // 另外还有对象的观察记录
       handlers.push({
         callback: callback,
         context: context,
@@ -349,9 +353,11 @@
   var triggerApi = function (objEvents, name, callback, args) {
     if (objEvents) {
       var events = objEvents[name];
-      var allEvents = objEvents.all; // ?
+      // 注册事件名为'all'的监听函数,不管name是什么都触发
+      var allEvents = objEvents.all;
       if (events && allEvents) allEvents = allEvents.slice();
       if (events) triggerEvents(events, args);
+      // 监听'all'的函数可以获取当前事件名作为第一个参数
       if (allEvents) triggerEvents(allEvents, [name].concat(args));
     }
     return objEvents;
@@ -453,7 +459,7 @@
 
       var attrs;
       // {key: value}形式
-      if (typeof key === 'obj') {
+      if (typeof key === 'object') {
         attrs = key;
         options = val;
       // key, value形式
@@ -755,7 +761,7 @@
     var type = methodMap[method];
 
     // 两个emulate的默认设置
-    _.defaults(options || (options ={}), {
+    _.defaults(options || (options = {}), {
       emulateHTTP: Backbone.emulateHTTP,
       emulateJSON: Backbone.emulateJSON
     });
@@ -823,4 +829,6 @@
   Backbone.ajax = function () {
     return Backbone.$.ajax.apply(Backbone.$, arguments);
   };
-}));
+
+  return Backbone;
+});

@@ -171,8 +171,8 @@
       if (listening) listening.count++;
 
       // 处理对象不光有callback,还有callback的上下文context和ctx,trigger时使用的
-      // 都是ctx,即没有传入context的情况下用的上下文就是对象自身,还要另存一份context
-      // 用于off时的比较
+      // 都是ctx,即没有传入context的情况下用的上下文就是对象自身,还要另存一份
+      // context用于off时的比较;
       // 另外还有对象的观察记录
       handlers.push({
         callback: callback,
@@ -397,6 +397,8 @@
     // extend先添加默认属性、传进来的属性,为防止传进来的attrs将某些应该是
     // 默认的属性覆盖成undefined,于是又调用_.defaults填充undefined属性,
     // 那为什么不_.defaults({}, attrs, defaults)?
+    // 因为直接_.defaults的话,Object.prototype的属性就覆盖不了了,
+    // 见test/model.js #37 #484
     attrs = _.defaults(_.extend({}, defaults, attrs), defaults);
     this.set(attrs, options);
     this.changed = {};
@@ -476,9 +478,9 @@
       var unset = options.unset;
       // 是否发出change事件
       var silent = options.silent;
-      // 方便触发事件的时候使用
+      // change的属性名存到数组中,方便触发事件遍历的时候使用
       var changes = [];
-      // _changing为false是什么情况?
+      // _changing为true是什么情况?
       var changing = this._changing;
       this._changing = true;
 
@@ -486,7 +488,7 @@
       // changed属性初始化
       if (!changing) {
         this._previousAttributes = _.clone(this.attributes);
-        // 跟previous相比change的属性
+        // change的属性
         this.changed = {};
       }
 
@@ -496,6 +498,7 @@
 
       for (var attr in attrs) {
         val = attrs[attr];
+        // _.isEqual: Deep equal comparision
         // 变化的属性存在changes里面,方便下面触发change事件时作为参数
         if (!_.isEqual(current[attr], val)) changes.push(attr);
         // changed存放变化的属性,如果本次和上次相等,那么从changed中删除该属性
@@ -600,6 +603,7 @@
     // 会再次被设定
     save: function (key, val, options) {
       var attrs;
+      // 可以save(null)
       if (key == null || typeof key === 'object') {
         attrs = key;
         options = val;
@@ -692,11 +696,17 @@
     // 默认的url,model在服务器上的标识
     url: function () {
       var base =
+        // 使用_.result,这样'urlRoot'可以是用户指定的一个字符串或者一个返回
+        // 字符串的函数
         _.result(this, 'urlRoot') ||
         _.result(this.collection, 'url') ||
         urlError();
       if (this.isNew()) return base;
       var id = this.get(this.idAttribute);
+      // $&为匹配的子串,在这里就是url结尾最后一个字符(除了/),相当于在最后加了
+      // 个'/'
+      // encodeURIComponent把字符串作为URI组件编码,会转义;/?:@&=+$,# 这些用于
+      // 分隔 URI 组件的标点符号
       return base.replace(/[^\/]$/, '$&/') + encodeURIComponent(id);
     },
 
@@ -706,7 +716,7 @@
     },
 
     clone: function () {
-      return this.constructor(this.attributes);
+      return new this.constructor(this.attributes);
     },
 
     // 所谓new就是模型还未被存入服务器,因而不会有服务器端id属性
@@ -731,7 +741,7 @@
   });
 
   // Model要实现的Underscore方法,值是参数数量
-  var modelMethods = {key: 1, values: 1, pairs: 1, invert: 1, pick: 0, omit: 0, chain: 1, isEmpty: 1};
+  var modelMethods = {keys: 1, values: 1, pairs: 1, invert: 1, pick: 0, omit: 0, chain: 1, isEmpty: 1};
 
   // 混入Underscore方法,以model的attributes属性作为上下文
   addUnderscoreMethods(Model, modelMethods, 'attributes');
@@ -1285,20 +1295,172 @@
   // Mix in each Underscore method as a proxy to `Collection#models`.
   addUnderscoreMethods(Collection, collectionMethods, 'models');
 
+  // Backbone.View
+  // -------------
 
-  // 需要一个URL而未提供时,抛出一个错误
-  var urlError = function () {
-    throw new Error('A "url" property or function must be specified');
+  // Creating a Backbone.View creates its initial element outside of the DOM,
+  // if an existing element is not provided...
+  var View = Backbone.View = function (options) {
+    this.cid = _.uniqueId('view');
+    this.preinitialize.apply(this, arguments);
+    _.extend(this, _.pick(options, viewOptions));
+    this._ensureElement();
+    this.initialize.apply(this, arguments);
   };
 
-  // 包装一下options中传入的error回调,使其调用的同时触发'error'事件
-  var wrapError = function (model, options) {
-    var error = options.error;
-    options.error = function (resp) {
-      if (error) error.call(options.context, model, resp, options);
-      model.trigger('error', model, resp, options);
-    };
-  };
+  // Cached regex to split keys for `delegate`.
+  // delegateEvents方法用到这个正则,delegateEvents方法中传入events的格式为
+  // *{"event selector": "callback"}*, 用这个正则来分割'event(事件名) selector(触发事件的元素)'
+  var delegateEventSplitter = /^(\S+)\s*(.*)$/;
+
+  // List of view options to be set as properties.
+  // 由用户指定的属性
+  var viewOptions = ['model', 'collection', 'el', 'id', 'attributes', 'className', 'tagName', 'events'];
+
+  // Set up all inheritable **Backbone.View** properties and methods.
+  _.extend(View.prototype, Events, {
+
+    // The default `tagName` of a View's element is `"div"`.
+    tagName: 'div',
+
+    // jQuery delegate for element lookup, scoped to DOM elements within the
+    // current view. This should be preferred to global lookups where possible.
+    $: function(selector) {
+      return this.$el.find(selector);
+    },
+
+    // preinitialize is an empty function by default. You can override it with a function
+    // or object.  preinitialize will run before any instantiation logic is run in the View
+    preinitialize: function(){},
+
+    // Initialize is an empty function by default. Override it with your own
+    // initialization logic.
+    initialize: function(){},
+
+    // **render** is the core function that your view should override, in order
+    // to populate its element (`this.el`), with the appropriate HTML. The
+    // convention is for **render** to always return `this`.
+    // 用户自己提供渲染方法
+    render: function() {
+      return this;
+    },
+
+    // Remove this view by taking the element out of the DOM, and removing any
+    // applicable Backbone.Events listeners.
+    remove: function() {
+      this._removeElement();
+      this.stopListening();
+      return this;
+    },
+
+    // Remove this view's element from the document and all event listeners
+    // attached to it. Exposed for subclasses using an alternative DOM
+    // manipulation(操纵) API.
+    _removeElement: function() {
+      this.$el.remove();
+    },
+
+    // Change the view's element (`this.el` property) and re-delegate the
+    // view's events on the new element.
+    setElement: function(element) {
+      this.undelegateEvents();
+      this._setElement(element);
+      this.delegateEvents();
+      return this;
+    },
+
+    // Creates the `this.el` and `this.$el` references for this view using the
+    // given `el`. `el` can be a CSS selector or an HTML string, a jQuery
+    // context or an element. Subclasses can override this to utilize an
+    // alternative DOM manipulation API and are only required to set the
+    // `this.el` property.
+    _setElement: function(el) {
+      this.$el = el instanceof Backbone.$ ? el : Backbone.$(el);
+      this.el = this.$el[0];
+    },
+
+    // Set callbacks, where `this.events` is a hash of
+    //
+    // *{"event selector": "callback"}*
+    //
+    //     {
+    //       'mousedown .title':  'edit',
+    //       'click .button':     'save',
+    //       'click .open':       function(e) { ... }
+    //     }
+    //
+    // pairs. Callbacks will be bound to the view, with `this` set properly.
+    // Uses event delegation for efficiency.(视图子元素上的事件都由视图元素代理,
+    // 提高效率)
+    // Omitting the selector binds the event to `this.el`.
+    delegateEvents: function(events) {
+      events || (events = _.result(this, 'events'));
+      if (!events) return this;
+      this.undelegateEvents();
+      for (var key in events) {
+        var method = events[key];
+        if (!_.isFunction(method)) method = this[method];
+        if (!method) continue;
+        // 第一个捕获是事件名,第二个捕获是触发的元素选择器
+        var match = key.match(delegateEventSplitter);
+        this.delegate(match[1], match[2], _.bind(method, this));
+      }
+      return this;
+    },
+
+    // Add a single event listener to the view's element (or a child element
+    // using `selector`). This only works for delegate-able events: not `focus`,
+    // `blur`, and not `change`, `submit`, and `reset` in Internet Explorer.
+    delegate: function(eventName, selector, listener) {
+      this.$el.on(eventName + '.delegateEvents' + this.cid, selector, listener);
+      return this;
+    },
+
+    // Clears all callbacks previously bound to the view by `delegateEvents`.
+    // You usually don't need to use this, but may wish to if you have multiple
+    // Backbone views attached to the same DOM element.
+    // 使用jQuery的事件命名空间方便地移除所有代理事件
+    undelegateEvents: function() {
+      if (this.$el) this.$el.off('.delegateEvents' + this.cid);
+      return this;
+    },
+
+    // A finer-grained `undelegateEvents` for removing a single delegated event.
+    // `selector` and `listener` are both optional.
+    undelegate: function(eventName, selector, listener) {
+      this.$el.off(eventName + '.delegateEvents' + this.cid, selector, listener);
+      return this;
+    },
+
+    // Produces a DOM element to be assigned to your view. Exposed for
+    // subclasses using an alternative DOM manipulation API.
+    _createElement: function(tagName) {
+      return document.createElement(tagName);
+    },
+
+    // Ensure that the View has a DOM element to render into.
+    // If `this.el` is a string, pass it through `$()`, take the first
+    // matching element, and re-assign it to `el`. Otherwise, create
+    // an element from the `id`, `className` and `tagName` properties.
+    _ensureElement: function() {
+      if (!this.el) {
+        var attrs = _.extend({}, _.result(this, 'attributes'));
+        if (this.id) attrs.id = _.result(this, 'id');
+        if (this.className) attrs['class'] = _.result(this, 'className');
+        this.setElement(this._createElement(_.result(this, 'tagName')));
+        this._setAttributes(attrs);
+      } else {
+        this.setElement(_.result(this, 'el'));
+      }
+    },
+
+    // Set attributes from a hash on this view's element.  Exposed for
+    // subclasses using an alternative DOM manipulation API.
+    _setAttributes: function(attributes) {
+      this.$el.attr(attributes);
+    }
+
+  });
 
 
   // Backbone.sync
@@ -1378,6 +1540,60 @@
   // 默认用$库的ajax方法发送ajax
   Backbone.ajax = function () {
     return Backbone.$.ajax.apply(Backbone.$, arguments);
+  };
+
+
+  // Helpers
+  // -------
+
+  // Helper function to correctly set up the prototype chain for subclasses.
+  // Similar to `goog.inherits`, but uses a hash of prototype properties and
+  // class properties to be extended.
+  // 非常典型的继承写法,子类可以通过__super__获取父类属性
+  var extend = function(protoProps, staticProps) {
+    var parent = this;
+    var child;
+
+    // The constructor function for the new subclass is either defined by you
+    // (the "constructor" property in your `extend` definition), or defaulted
+    // by us to simply call the parent constructor.
+    if (protoProps && _.has(protoProps, 'constructor')) {
+      child = protoProps.constructor;
+    } else {
+      child = function(){ return parent.apply(this, arguments); };
+    }
+
+    // Add static properties to the constructor function, if supplied.
+    // 静态属性放构造函数上
+    _.extend(child, parent, staticProps);
+
+    // Set the prototype chain to inherit from `parent`, without calling
+    // `parent`'s constructor function and add the prototype properties.
+    // _.create: basically Object.create
+    child.prototype = _.create(parent.prototype, protoProps);
+    child.prototype.constructor = child;
+
+    // Set a convenience property in case the parent's prototype is needed
+    // later.
+    child.__super__ = parent.prototype;
+
+    return child;
+  };
+
+  Model.extend = Collection.extend = Router.extend = View.extend = History.extend = extend;
+
+  // 需要一个URL而未提供时,抛出一个错误
+  var urlError = function () {
+    throw new Error('A "url" property or function must be specified');
+  };
+
+  // 包装一下options中传入的error回调,使其调用的同时触发'error'事件
+  var wrapError = function (model, options) {
+    var error = options.error;
+    options.error = function (resp) {
+      if (error) error.call(options.context, model, resp, options);
+      model.trigger('error', model, resp, options);
+    };
   };
 
   return Backbone;
